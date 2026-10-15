@@ -1,125 +1,248 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Dexa Audit
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+Dexa Audit is the event-consumer service for the **Dexa Work-From-Home (WFH) Attendance System**. It receives employee profile-change events from RabbitMQ, validates their payloads, and stores audit records in PostgreSQL.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+The service is designed to handle audit events asynchronously, keeping audit persistence separate from the main backend request flow.
 
-## Description
+## Features
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+- **Asynchronous event processing** — consumes employee profile-change events through RabbitMQ.
+- **Event validation** — checks JSON payloads, UUIDs, event types, changed-field values, and timestamps before processing.
+- **Persistent audit records** — stores audit events in PostgreSQL.
+- **Duplicate-event protection** — uses the event ID to avoid inserting the same event more than once.
+- **Message acknowledgements** — acknowledges successfully persisted events and requeues messages when database persistence fails.
+- **Connection recovery** — retries RabbitMQ connections when the broker is unavailable.
+- **Dead-letter queue configuration** — declares a dead-letter queue for the profile-change queue.
 
-## Project setup
+## Technology Stack
 
-```bash
-$ npm install
+- **Runtime:** Node.js
+- **Framework:** NestJS 12
+- **Language:** TypeScript
+- **Message broker:** RabbitMQ
+- **RabbitMQ client:** `amqplib`
+- **Database:** PostgreSQL
+- **PostgreSQL client:** `pg`
+- **Testing:** Vitest and Supertest
+- **Code quality:** Oxlint and Prettier
+
+## Architecture
+
+Dexa Audit works alongside the Dexa backend. The backend publishes profile-change events, and this service consumes and persists them.
+
+```text
+Dexa Employees / Dexa HR
+          |
+          v
+      Dexa Backend
+          |
+          | Profile-change event
+          v
+       RabbitMQ
+          |
+          | employee.profile.changed
+          v
+       Dexa Audit
+          |
+          | Validate event
+          | Insert audit record
+          v
+     PostgreSQL
+       audit_logs
 ```
 
-## Compile and run the project
+This is an asynchronous workflow: the backend publishes the event, while Dexa Audit processes it independently.
 
-```bash
-# development
-$ npm run start
+## Event Contract
 
-# watch mode
-$ npm run start:dev
+The service consumes the `employee.profile.changed` event from the RabbitMQ queue with the same name.
 
-# production mode
-$ npm run start:prod
+Example payload:
+
+```json
+{
+  "eventId": "6b2a9b0c-3d4e-4f5a-8b7c-9d0e1f2a3b4c",
+  "eventType": "employee.profile.changed",
+  "employeeId": "7c3b0a1d-4e5f-4a6b-9c8d-0e1f2a3b4c5d",
+  "changedFields": ["fullName", "phoneNumber"],
+  "occurredAt": "2026-01-15T08:30:00.000Z"
+}
 ```
 
-## Run tests
+The UUIDs and timestamp above are illustrative examples.
 
-```bash
-# unit tests
-$ npm run test
+| Field | Description |
+|---|---|
+| `eventId` | Unique event identifier used for duplicate protection. |
+| `eventType` | Event type; currently `employee.profile.changed`. |
+| `employeeId` | UUID of the employee whose profile changed. |
+| `changedFields` | Names of the fields that changed, rather than their old and new values. |
+| `occurredAt` | Timestamp representing when the event occurred. |
 
-# e2e tests
-$ npm run test:e2e
+The consumer validates the payload before attempting to store it.
 
-# test coverage
-$ npm run test:cov
+## RabbitMQ Message Handling
+
+The consumer declares two durable queues:
+
+- `employee.profile.changed` — receives profile-change events.
+- `employee.profile.changed.dead` — configured as the dead-letter destination.
+
+The consumer uses manual acknowledgements and a prefetch limit of 10 messages.
+
+| Outcome | Consumer behavior |
+|---|---|
+| Event is valid and saved | Acknowledges the message. |
+| Event contains invalid JSON | Rejects the message without requeueing. |
+| Event has an invalid payload | Rejects the message without requeueing. |
+| Database persistence fails | Negatively acknowledges the message and requests requeueing. |
+| RabbitMQ connection fails | Logs the error and retries after a delay. |
+
+**Delivery note:** RabbitMQ requeueing can cause a message to be delivered more than once. The database insert uses the event ID as its conflict key, making repeated processing of the same event safe against duplicate inserts.
+
+The dead-letter queue is declared and configured on the primary queue. Actual dead-letter routing depends on the broker’s handling of rejected or otherwise dead-lettered messages.
+
+## Database
+
+Dexa Audit uses PostgreSQL to store audit records in the `audit_logs` table.
+
+The SQL script in the repository's `sql/` directory is provided for initial database setup. It is not managed by Prisma, and the service does not automatically create the database schema.
+
+Before starting the service, create the database, run the SQL initialization script, and configure `AUDIT_DATABASE_URL` to point to that database.
+
+### Database setup
+
+Create a PostgreSQL database for the audit service and configure `AUDIT_DATABASE_URL`.
+
+Before starting the service, apply the SQL schema or initialization script provided in the repository's `sql/` directory to create the required `audit_logs` table.
+
+The service expects the table to exist; it does not create the schema automatically.
+
+## RabbitMQ Message Handling
+
+Dexa Audit consumes profile-change events from the `employee.profile.changed` queue.
+
+- Successfully processed events are acknowledged after being saved to PostgreSQL.
+- Invalid messages are rejected without being requeued.
+- Messages that fail because of a database error are requeued for another processing attempt.
+- RabbitMQ connection failures are logged, and the service retries the connection.
+- A dead-letter queue, `employee.profile.changed.dead`, is configured to support handling messages that cannot be processed normally.
+
+Messages may be delivered more than once. To prevent duplicate audit records, the database insert uses the event ID to ignore events that have already been recorded.
+
+**Note:** A dead-letter queue is a separate queue for messages that cannot be processed normally. Whether a rejected message is routed there depends on RabbitMQ's queue configuration and rejection behavior.
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js and npm
+- A reachable RabbitMQ instance
+- A PostgreSQL database
+- The `audit_logs` table initialized from the repository's SQL scripts
+
+### 1. Clone the repository
+
+```text
+git clone https://github.com/AdriAntoriV2/dexa-audit.git
 ```
 
-## Deployment
+### 2. Install dependencies
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+```text
+npm install
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+### 3. Configure environment variables
 
-## Observability
+Copy `.env.example` to `.env`, then provide the connection details for your environment.
 
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
-
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
-
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
-
-To add it to this project:
-
-```bash
-$ npm install @nestjs/observe
+```text
+RABBITMQ_URL=amqp://username:password@localhost:5672
+AUDIT_DATABASE_URL=postgresql://username:password@localhost:5432/dexa_audit
 ```
 
-Then follow the [setup guide](https://docs.nestjs.com/observability/overview) - it takes a single import and an app key.
+These are example formats. Replace the credentials, host, port, and database name with your actual values. If your PostgreSQL provider requires SSL settings, use the connection string and options supplied by that provider.
 
-The free plan needs no payment details and covers 300,000 events a month. You can also browse the [live demo](https://www.observe-demo.nestjs.com/dashboard) first - the whole dashboard over a busy service's data, with nothing to install.
+Do not commit real credentials or connection strings to version control.
 
-## Resources
+### 4. Start the service
 
-Check out a few resources that may come in handy when working with NestJS:
+Development mode:
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observe](https://observe.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+```text
+npm run start:dev
+```
 
-## Support
+Build the application:
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+```text
+npm run build
+```
 
-## Stay in touch
+Run the compiled application:
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+```text
+npm run start:prod
+```
+
+The application listens on port `3000` by default. The port can be changed using the `PORT` environment variable.
+
+## Testing
+
+The project uses Vitest for its test suite.
+
+Run unit tests:
+
+```text
+npm run test
+```
+
+Run tests in watch mode:
+
+```text
+npm run test:watch
+```
+
+Run end-to-end tests:
+
+```text
+npm run test:e2e
+```
+
+Generate test coverage:
+
+```text
+npm run test:cov
+```
+
+Run linting:
+
+```text
+npm run lint
+```
+
+Format source and test files:
+
+```text
+npm run format
+```
+
+## Related Projects
+
+Dexa Audit is part of a multi-repository WFH attendance system:
+
+- [Dexa Employees](https://github.com/AdriAntoriV2/dexa-employees) — employee-facing application.
+- [Dexa HR](https://github.com/AdriAntoriV2/dexa-hr) — HR-facing application.
+- [Dexa Backend](https://github.com/AdriAntoriV2/dexa-backend) — backend API and event publisher.
+- [Dexa Audit](https://github.com/AdriAntoriV2/dexa-audit) — asynchronous audit-event consumer and persistence service.
+
+## Scope and Limitations
+
+Dexa Audit currently handles the profile-change event contract described above. It records the changed field names, not a full before-and-after snapshot of the employee profile.
+
+The service is a background consumer rather than a documented public REST API. Its primary responsibility is to validate incoming events and persist audit records.
 
 ## License
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
-# dexa-audit
+This project is currently marked `UNLICENSED` in its package metadata. No open-source license is implied by this README.
